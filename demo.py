@@ -1,7 +1,8 @@
-"""demo:合成栈展开的正常三帧恢复 + 损坏帧诊断 + 输入拒绝边界。
+"""demo:合成栈展开的正常三帧恢复 + 损坏帧诊断 + 输入拒绝边界
+       + 协程栈段切换展开 + 损坏切换目标诊断。
 
 全部数据由本文件确定性生成,真实调用 unwind 计算,无预录结果。
-运行:python demo.py
+运行:./.venv/bin/python demo.py
 """
 
 import os
@@ -13,6 +14,9 @@ from unwind import (
     CfaRule,
     Offset,
     SameValue,
+    SegmentTable,
+    StackSegment,
+    SwitchRule,
     TableEntry,
     UnwindInputError,
     UnwindTable,
@@ -53,9 +57,50 @@ def show(result, title):
             for k, v in sorted(f.registers.items())
         )
         cfa = f"0x{f.cfa:x}" if f.cfa is not None else "<未算出>"
-        print(f"  帧 {f.index}: pc=0x{f.pc:04x} cfa={cfa}  {regs}")
+        seg = f"段 {f.segment}" if f.segment is not None else "单段"
+        print(f"  帧 {f.index}: [{seg}] pc=0x{f.pc:04x} cfa={cfa}  {regs}")
     print(f"  终止: {result.termination}")
     print()
+
+
+def build_coroutine_demo():
+    """协程场景:主栈段在高地址,协程栈段在低地址(地址顺序相反)。
+
+    主栈帧在 0x8090 处保存一条切换记录:[下一段=2, sp, fp, ra];
+    协程栈段内是普通的帧指针链,直到返回地址 0(栈底)。
+    """
+    hi = bytearray(0x100)  # 段 1:主栈 [0x8000, 0x8100)
+    lo = bytearray(0x100)  # 段 2:协程栈 [0x1000, 0x1100)
+
+    def put(mem, addr, base, value):
+        off = addr - base
+        mem[off:off + 8] = value.to_bytes(8, "little")
+
+    # 主栈帧底部的切换记录:回到协程栈段 2 的 (sp, fp, ra)。
+    put(hi, 0x8090, 0x8000, 2)
+    put(hi, 0x8098, 0x8000, 0x1040)   # 协程 sp
+    put(hi, 0x80A0, 0x8000, 0x1050)   # 协程 fp
+    put(hi, 0x80A8, 0x8000, 0x2050)   # 协程调用点(返回地址)
+    # 协程栈段内的帧指针链:cfa = fp + 0x10。
+    put(lo, 0x1050, 0x1000, 0x1070)   # 旧 fp
+    put(lo, 0x1058, 0x1000, 0x2080)   # 返回地址
+    put(lo, 0x1070, 0x1000, 0x1090)
+    put(lo, 0x1078, 0x1000, 0)        # 栈底
+
+    segments = SegmentTable([
+        StackSegment(1, 0x8000, 0x8100, 8, hi),
+        StackSegment(2, 0x1000, 0x1100, 8, lo),
+    ])
+    table = UnwindTable([
+        # 主栈当前帧:切换点,记录在 CFA 处。
+        TableEntry(0x3000, 0x3100, CfaRule("sp", 0x10), {},
+                   switch=SwitchRule(0, ("sp", "fp", "ra"))),
+        # 协程栈上的帧:经典帧指针链。
+        TableEntry(0x2000, 0x2100, CfaRule("fp", 0x10),
+                   {"fp": Offset(-0x10), "ra": Offset(-0x8)}),
+    ])
+    regs = {"sp": 0x8080, "fp": 0x8080, "ra": 0x2FFF}
+    return segments, table, regs, hi
 
 
 def main():
@@ -90,6 +135,29 @@ def main():
     except UnwindInputError as exc:
         print(f"--- 输入拒绝(实际触发)---")
         print(f"  UnwindInputError: {exc}")
+        print()
+
+    # 4) 协程栈段切换:主栈(高地址段 1)-> 协程栈(低地址段 2)。
+    #    跨段 CFA 从 0x8090 降到 0x1060——旧单段模型会误判为栈损坏,
+    #    显式切换记录使展开得以继续,段内 CFA 仍严格递增。
+    segments, seg_table, seg_regs, hi = build_coroutine_demo()
+    crossed = unwind(0x3040, seg_regs, None, seg_table,
+                     segments=segments, initial_segment=1)
+    show(crossed, "协程栈段切换(段 1 高地址 -> 段 2 低地址)")
+    f = crossed.frames
+    print(f"  说明: 跨段 CFA 0x{f[0].cfa:x} -> 0x{f[1].cfa:x} 全局下降,"
+          f"但切换是段表中显式声明的,展开继续;段 2 内 CFA 递增:"
+          f"0x{f[1].cfa:x} -> 0x{f[2].cfa:x}。")
+    print()
+
+    # 5) 损坏的切换目标:记录中的段 ID 被篡改为未声明的 99。
+    hi[0x90:0x98] = (99).to_bytes(8, "little")
+    broken = unwind(0x3040, seg_regs, None, seg_table,
+                    segments=segments, initial_segment=1)
+    show(broken, "损坏切换目标诊断(记录中的段 ID 被篡改为 99)")
+    print(f"  诊断: 停在上一个完整帧(帧 {broken.frames[-1].index}),"
+          f"原因 {broken.termination.reason.value};"
+          f"跨段只允许段表中声明的目标,不按地址大小猜测。")
 
 
 if __name__ == "__main__":
