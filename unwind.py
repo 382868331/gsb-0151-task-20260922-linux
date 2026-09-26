@@ -21,6 +21,21 @@
 - 最多 ``MAX_FRAMES``(128)帧;预算耗尽(``MAX_FRAMES_REACHED``)与
   已证明的终止(返回地址为 0、无规则等)是不同的终止原因。
 
+表达式规则(本迭代新增):
+
+- ``CfaExpr(expr)`` 可替代 ``CfaRule`` 作为表项的 CFA 规则;
+  ``ExprRule(expr)`` 是一种新的寄存器恢复规则。表达式是一棵小树,
+  节点仅有:``Const``(常量)、``Reg``(读旧帧寄存器)、``Add``/
+  ``Sub``/``And``(64 位无符号回绕运算)、``Deref``(定宽 1/2/4/8
+  字节小端解引用)、``Select``(条件选择,只求值被选中分支)。
+- 寄存器规则表达式中可用 ``Cfa()`` 引用本帧已算出的 CFA;CFA 表达式
+  中出现 ``Cfa()`` 属于非法自引用,构造表项时即拒绝。
+- 每棵表达式节点数 <= ``MAX_EXPR_NODES``、嵌套深度 <=
+  ``MAX_EXPR_DEPTH``,单次求值步数 <= ``MAX_EXPR_STEPS``;
+  超限的非法程序在展开前拒绝。
+- 一帧需要的所有内存读取先全部求值验证,任一越界则以
+  ``MEMORY_OUT_OF_BOUNDS`` 终止,不返回半个成功帧。
+
 错误语义:
 
 - 所有数值参数必须是 ``int``;``bool`` 一律拒绝,浮点(包括 NaN 与
@@ -45,8 +60,19 @@ __all__ = [
     "Undefined",
     "Offset",
     "Constant",
+    "ExprRule",
+    "Const",
+    "Reg",
+    "Cfa",
+    "Add",
+    "Sub",
+    "And",
+    "Deref",
+    "Select",
+    "Expr",
     "Rule",
     "CfaRule",
+    "CfaExpr",
     "TableEntry",
     "UnwindTable",
     "TerminationReason",
@@ -55,6 +81,9 @@ __all__ = [
     "UnwindResult",
     "unwind",
     "MAX_FRAMES",
+    "MAX_EXPR_NODES",
+    "MAX_EXPR_DEPTH",
+    "MAX_EXPR_STEPS",
     "UINT64_MAX",
 ]
 
@@ -68,6 +97,14 @@ MAX_FRAMES = 128
 MAX_TABLE_ENTRIES = 1024
 #: 单次调用的寄存器数量上限(防御性边界,README 中说明)。
 MAX_REGISTERS = 256
+#: 单棵表达式的节点数上限(非法程序在展开前拒绝)。
+MAX_EXPR_NODES = 64
+#: 单棵表达式的嵌套深度上限(求值栈深上限)。
+MAX_EXPR_DEPTH = 16
+#: 单次表达式求值的步数(指令数)上限。
+MAX_EXPR_STEPS = 256
+#: Deref 允许的读取宽度(定宽小端解引用)。
+_DEREF_WIDTHS = (1, 2, 4, 8)
 
 
 class UnwindInputError(ValueError):
@@ -144,8 +181,288 @@ class Constant:
         _require_uint64(self.value, "Constant.value")
 
 
-Rule = Union[SameValue, Undefined, Offset, Constant]
-_RULE_TYPES = (SameValue, Undefined, Offset, Constant)
+# ---------------------------------------------------------------------------
+# 表达式:常量 / 寄存器读取 / 加减 / 按位与 / 定宽解引用 / 选择。
+# 不是完整调试语言;所有运算为 64 位无符号回绕,解引用定宽小端。
+# ---------------------------------------------------------------------------
+
+class Expr:
+    """表达式节点基类。子类均为冻结 dataclass。"""
+
+    __slots__ = ()
+
+
+@dataclass(frozen=True)
+class Const(Expr):
+    """无符号 64 位常量。"""
+
+    value: int
+
+    def __post_init__(self) -> None:
+        _require_uint64(self.value, "Const.value")
+
+
+@dataclass(frozen=True)
+class Reg(Expr):
+    """读取旧帧快照中的寄存器值(并行语义,与同帧其他规则互不干扰)。"""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        _require_reg_name(self.name, "Reg.name")
+
+
+@dataclass(frozen=True)
+class Cfa(Expr):
+    """引用本帧已算出的 CFA。只允许出现在寄存器规则表达式中;
+    出现在 CFA 表达式里属于非法自引用,构造表项时即拒绝。"""
+
+
+def _require_expr(value: object, name: str) -> "Expr":
+    if not isinstance(value, Expr):
+        raise UnwindInputError(
+            f"{name} 必须是表达式节点,得到 "
+            f"{type(value).__name__}: {value!r}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class Add(Expr):
+    """a + b(mod 2**64,无符号回绕)。"""
+
+    a: Expr
+    b: Expr
+
+    def __post_init__(self) -> None:
+        _require_expr(self.a, "Add.a")
+        _require_expr(self.b, "Add.b")
+
+
+@dataclass(frozen=True)
+class Sub(Expr):
+    """a - b(mod 2**64,无符号回绕)。"""
+
+    a: Expr
+    b: Expr
+
+    def __post_init__(self) -> None:
+        _require_expr(self.a, "Sub.a")
+        _require_expr(self.b, "Sub.b")
+
+
+@dataclass(frozen=True)
+class And(Expr):
+    """a & b(按位与;常用于对齐,如 And(Add(Reg sp, 15), 掩码))。"""
+
+    a: Expr
+    b: Expr
+
+    def __post_init__(self) -> None:
+        _require_expr(self.a, "And.a")
+        _require_expr(self.b, "And.b")
+
+
+@dataclass(frozen=True)
+class Deref(Expr):
+    """在 addr 表达式的结果处读 width 字节(1/2/4/8,小端无符号)。"""
+
+    addr: Expr
+    width: int
+
+    def __post_init__(self) -> None:
+        _require_expr(self.addr, "Deref.addr")
+        _require_int(self.width, "Deref.width")
+        if self.width not in _DEREF_WIDTHS:
+            raise UnwindInputError(
+                f"Deref.width 必须是 {_DEREF_WIDTHS} 之一,"
+                f"得到 {self.width!r}"
+            )
+
+
+@dataclass(frozen=True)
+class Select(Expr):
+    """cond != 0 时取 if_true,否则取 if_false;
+    只求值被选中的分支(未被选中的分支不触发解引用)。"""
+
+    cond: Expr
+    if_true: Expr
+    if_false: Expr
+
+    def __post_init__(self) -> None:
+        _require_expr(self.cond, "Select.cond")
+        _require_expr(self.if_true, "Select.if_true")
+        _require_expr(self.if_false, "Select.if_false")
+
+
+def _expr_children(node: Expr) -> Tuple[Expr, ...]:
+    if isinstance(node, (Const, Reg, Cfa)):
+        return ()
+    if isinstance(node, (Add, Sub, And)):
+        return (node.a, node.b)
+    if isinstance(node, Deref):
+        return (node.addr,)
+    if isinstance(node, Select):
+        return (node.cond, node.if_true, node.if_false)
+    raise UnwindInputError(f"未知表达式节点类型: {type(node).__name__}")
+
+
+def _validate_expr_tree(node: Expr, name: str) -> None:
+    """展开前校验:节点数与嵌套深度上限,超限即拒绝(非法程序)。"""
+    count = 0
+    stack: List[Tuple[Expr, int]] = [(node, 1)]
+    while stack:
+        cur, depth = stack.pop()
+        count += 1
+        if count > MAX_EXPR_NODES:
+            raise UnwindInputError(
+                f"{name} 的表达式节点数超过上限 {MAX_EXPR_NODES}"
+            )
+        if depth > MAX_EXPR_DEPTH:
+            raise UnwindInputError(
+                f"{name} 的表达式嵌套深度超过上限 {MAX_EXPR_DEPTH}"
+            )
+        for child in _expr_children(cur):
+            stack.append((child, depth + 1))
+
+
+def _expr_registers(node: Expr) -> set:
+    """表达式引用到的寄存器名集合(用于展开前的存在性校验)。"""
+    found: set = set()
+    stack: List[Expr] = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, Reg):
+            found.add(cur.name)
+        stack.extend(_expr_children(cur))
+    return found
+
+
+def _expr_uses_cfa(node: Expr) -> bool:
+    stack: List[Expr] = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, Cfa):
+            return True
+        stack.extend(_expr_children(cur))
+    return False
+
+
+class _ExprUndefinedReg(Exception):
+    """求值时读到不可恢复(None)的寄存器。"""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
+class _ExprOutOfBounds(Exception):
+    """求值时解引用越界。"""
+
+    def __init__(self, addr: int, width: int) -> None:
+        super().__init__(addr, width)
+        self.addr = addr
+        self.width = width
+
+
+def _eval_expr(
+    node: Expr,
+    regs: Mapping[str, Optional[int]],
+    cfa: Optional[int],
+    memory: Union[bytes, bytearray],
+) -> int:
+    """在旧帧快照 regs 上求值;返回 64 位无符号结果。
+
+    显式栈 + 步数预算;所有运算 mod 2**64 回绕;解引用定宽小端,
+    越界抛 _ExprOutOfBounds,读 None 寄存器抛 _ExprUndefinedReg。
+    """
+    mem_len = len(memory)
+    steps = 0
+    stack: List[Tuple[str, object]] = [("e", node)]
+    values: List[int] = []
+
+    def push_value(v: int) -> None:
+        values.append(v & UINT64_MAX)
+
+    while stack:
+        steps += 1
+        if steps > MAX_EXPR_STEPS:
+            raise UnwindInputError(
+                f"表达式求值步数超过上限 {MAX_EXPR_STEPS}(非法程序)"
+            )
+        tag, payload = stack.pop()
+        if tag == "e":
+            cur = payload
+            if isinstance(cur, Const):
+                push_value(cur.value)
+            elif isinstance(cur, Reg):
+                v = regs[cur.name]
+                if v is None:
+                    raise _ExprUndefinedReg(cur.name)
+                push_value(v)
+            elif isinstance(cur, Cfa):
+                # cfa 为 None 只会发生在 CFA 表达式里出现 Cfa() 时,
+                # 该情况已在构造表项时拒绝;此处防御。
+                if cfa is None:
+                    raise UnwindInputError(
+                        "CFA 表达式不得递归引用 Cfa()(非法自引用)"
+                    )
+                push_value(cfa)
+            elif isinstance(cur, (Add, Sub, And)):
+                stack.append(("op", cur))
+                stack.append(("e", cur.b))
+                stack.append(("e", cur.a))
+            elif isinstance(cur, Deref):
+                stack.append(("op", cur))
+                stack.append(("e", cur.addr))
+            elif isinstance(cur, Select):
+                stack.append(("op", cur))
+                stack.append(("e", cur.cond))
+            else:  # pragma: no cover - 构造时已校验
+                raise UnwindInputError(
+                    f"未知表达式节点类型: {type(cur).__name__}"
+                )
+        else:  # "op":归约
+            cur = payload
+            if isinstance(cur, Add):
+                b, a = values.pop(), values.pop()
+                push_value(a + b)
+            elif isinstance(cur, Sub):
+                b, a = values.pop(), values.pop()
+                push_value(a - b)
+            elif isinstance(cur, And):
+                b, a = values.pop(), values.pop()
+                push_value(a & b)
+            elif isinstance(cur, Deref):
+                addr = values.pop()
+                if addr + cur.width > mem_len:
+                    raise _ExprOutOfBounds(addr, cur.width)
+                push_value(
+                    int.from_bytes(
+                        memory[addr:addr + cur.width], "little"
+                    )
+                )
+            else:  # Select:惰性,只求值被选中分支
+                cond = values.pop()
+                stack.append(
+                    ("e", cur.if_true if cond != 0 else cur.if_false)
+                )
+    return values[0]
+
+
+@dataclass(frozen=True)
+class ExprRule:
+    """寄存器恢复规则:用小表达式在旧帧快照上求值(可引用 Cfa())。"""
+
+    expr: Expr
+
+    def __post_init__(self) -> None:
+        _require_expr(self.expr, "ExprRule.expr")
+        _validate_expr_tree(self.expr, "ExprRule.expr")
+
+
+Rule = Union[SameValue, Undefined, Offset, Constant, ExprRule]
+_RULE_TYPES = (SameValue, Undefined, Offset, Constant, ExprRule)
 
 
 @dataclass(frozen=True)
@@ -161,6 +478,25 @@ class CfaRule:
 
 
 @dataclass(frozen=True)
+class CfaExpr:
+    """CFA = 小表达式在旧帧快照上的求值结果。
+
+    表达式中不得出现 Cfa()(CFA 不能递归读取自己),否则构造即拒绝。
+    """
+
+    expr: Expr
+
+    def __post_init__(self) -> None:
+        _require_expr(self.expr, "CfaExpr.expr")
+        _validate_expr_tree(self.expr, "CfaExpr.expr")
+        if _expr_uses_cfa(self.expr):
+            raise UnwindInputError(
+                "CfaExpr.expr 不得包含 Cfa()(CFA 表达式不允许递归"
+                "读取自己,非法自引用)"
+            )
+
+
+@dataclass(frozen=True)
 class TableEntry:
     """半开 PC 范围 ``[start, end)`` 内有效的展开规则。
 
@@ -169,7 +505,7 @@ class TableEntry:
 
     start: int
     end: int
-    cfa: CfaRule
+    cfa: Union[CfaRule, CfaExpr]
     rules: Mapping[str, Rule]
 
     def __post_init__(self) -> None:
@@ -180,9 +516,9 @@ class TableEntry:
                 f"TableEntry 要求 start < end,得到 "
                 f"[0x{self.start:x}, 0x{self.end:x})"
             )
-        if not isinstance(self.cfa, CfaRule):
+        if not isinstance(self.cfa, (CfaRule, CfaExpr)):
             raise UnwindInputError(
-                f"TableEntry.cfa 必须是 CfaRule,得到 "
+                f"TableEntry.cfa 必须是 CfaRule 或 CfaExpr,得到 "
                 f"{type(self.cfa).__name__}: {self.cfa!r}"
             )
         if not isinstance(self.rules, Mapping):
@@ -374,12 +710,22 @@ def unwind(
         )
     # 表引用的寄存器必须都在寄存器全集内:前置校验,避免展开到一半才报错。
     for ei, entry in enumerate(table.entries):
-        if entry.cfa.register not in initial:
-            raise UnwindInputError(
-                f"表项 {ei} ([0x{entry.start:x}, 0x{entry.end:x})) 的 CFA 基"
-                f"寄存器 {entry.cfa.register!r} 不在 registers 中"
-            )
-        for name in entry.rules:
+        cfa_refs: set = set()
+        if isinstance(entry.cfa, CfaRule):
+            cfa_refs.add(entry.cfa.register)
+        else:  # CfaExpr
+            cfa_refs |= _expr_registers(entry.cfa.expr)
+        for ref in sorted(cfa_refs):
+            if ref not in initial:
+                raise UnwindInputError(
+                    f"表项 {ei} ([0x{entry.start:x}, 0x{entry.end:x})) 的 "
+                    f"CFA 规则引用了 registers 中不存在的寄存器 {ref!r}"
+                )
+        rule_refs: set = set(entry.rules)
+        for rule in entry.rules.values():
+            if isinstance(rule, ExprRule):
+                rule_refs |= _expr_registers(rule.expr)
+        for name in sorted(rule_refs):
             if name not in initial:
                 raise UnwindInputError(
                     f"表项 {ei} 引用了 registers 中不存在的寄存器 {name!r}"
@@ -406,21 +752,37 @@ def unwind(
             )
             break
 
-        base = cur_regs[entry.cfa.register]
-        if base is None:
-            termination = Termination(
-                TerminationReason.CFA_REGISTER_UNDEFINED,
-                f"帧 {frame_index}:CFA 基寄存器 {entry.cfa.register!r} "
-                f"在此帧不可恢复(undefined)",
-            )
-            break
-        cfa = base + entry.cfa.offset
+        if isinstance(entry.cfa, CfaRule):
+            base = cur_regs[entry.cfa.register]
+            if base is None:
+                termination = Termination(
+                    TerminationReason.CFA_REGISTER_UNDEFINED,
+                    f"帧 {frame_index}:CFA 基寄存器 "
+                    f"{entry.cfa.register!r} 在此帧不可恢复(undefined)",
+                )
+                break
+            cfa = base + entry.cfa.offset
+        else:  # CfaExpr:在旧帧快照上求值;不允许 Cfa()(构造时已拒绝)。
+            try:
+                cfa = _eval_expr(entry.cfa.expr, cur_regs, None, memory)
+            except _ExprUndefinedReg as exc:
+                termination = Termination(
+                    TerminationReason.CFA_REGISTER_UNDEFINED,
+                    f"帧 {frame_index}:CFA 表达式读到的寄存器 "
+                    f"{exc.name!r} 在此帧不可恢复(undefined)",
+                )
+                break
+            except _ExprOutOfBounds as exc:
+                termination = Termination(
+                    TerminationReason.MEMORY_OUT_OF_BOUNDS,
+                    f"帧 {frame_index}:CFA 表达式在地址 0x{exc.addr:x} "
+                    f"读 {exc.width} 字节越界(内存大小 0x{mem_len:x})",
+                )
+                break
         if not 0 <= cfa <= UINT64_MAX:
             termination = Termination(
                 TerminationReason.CFA_OUT_OF_RANGE,
-                f"帧 {frame_index}:CFA 0x{cfa:x} 超出无符号 64 位范围 "
-                f"(基寄存器 {entry.cfa.register!r}=0x{base:x}, "
-                f"偏移 {entry.cfa.offset})",
+                f"帧 {frame_index}:CFA 0x{cfa:x} 超出无符号 64 位范围",
             )
             break
         if cfa % 8 != 0:
@@ -439,6 +801,7 @@ def unwind(
         cfas.append(cfa)
 
         # 并行恢复:所有规则的输入都是旧帧快照 cur_regs 与上面的 cfa。
+        # 先全部求值(纯计算,不提交),任一越界即终止且不产生部分帧。
         new_regs: Dict[str, Optional[int]] = {}
         oob: Optional[int] = None
         for name in sorted(cur_regs):
@@ -449,6 +812,17 @@ def unwind(
                 new_regs[name] = None
             elif isinstance(rule, Constant):
                 new_regs[name] = rule.value
+            elif isinstance(rule, ExprRule):
+                try:
+                    new_regs[name] = _eval_expr(
+                        rule.expr, cur_regs, cfa, memory
+                    )
+                except _ExprUndefinedReg:
+                    # 表达式读到不可恢复的寄存器:结果同样不可恢复。
+                    new_regs[name] = None
+                except _ExprOutOfBounds as exc:
+                    oob = exc.addr
+                    break
             else:  # Offset
                 addr = cfa + rule.offset
                 if addr < 0 or addr + 8 > mem_len:

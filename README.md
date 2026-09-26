@@ -8,11 +8,22 @@
 - Python 3.14.7,仅标准库,安装 Python 后无需任何其他依赖。
 - 核心、测试、演示全部离线;示例数据由仓库内代码确定性生成。
 
+## 环境准备
+
+```sh
+python3.14 -m venv .venv          # 或任意 Python 3.14.7 解释器
+source .venv/bin/activate         # 可选;直接用 .venv/bin/python 亦可
+```
+
+无需安装任何第三方包(`requirements.txt` 为空);以下命令中的
+`python` 指 3.14.7 解释器。
+
 ## 命令
 
 ```sh
 python -m unittest discover -s tests -v   # 运行测试
 python demo.py                            # 运行演示(约 1 秒内完成)
+python demo_iteration.py                  # 表达式规则演示(秒级完成)
 ```
 
 ## 接口
@@ -21,8 +32,11 @@ python demo.py                            # 运行演示(约 1 秒内完成)
 from unwind import (
     unwind, UnwindTable, TableEntry, CfaRule,
     SameValue, Undefined, Offset, Constant,
+    CfaExpr, ExprRule,
+    Const, Reg, Cfa, Add, Sub, And, Deref, Select,
     UnwindResult, Frame, Termination, TerminationReason,
     UnwindInputError, MAX_FRAMES,
+    MAX_EXPR_NODES, MAX_EXPR_DEPTH, MAX_EXPR_STEPS,
 )
 
 result = unwind(pc, registers, memory, table,
@@ -40,6 +54,40 @@ result = unwind(pc, registers, memory, table,
 - 规则:`SameValue()`(保持旧值)、`Undefined()`(不可恢复,值为
   `None`)、`Offset(n)`(在 `CFA+n` 处读 8 字节)、`Constant(v)`。
   表项未覆盖的寄存器按 `SameValue` 处理。
+
+## 表达式规则(本迭代新增)
+
+固定寄存器加偏移不够用时,CFA 与保存寄存器规则可改用小表达式:
+
+- `CfaExpr(expr)` 替代 `CfaRule` 作为表项的 CFA 规则;
+  `ExprRule(expr)` 是一种新的寄存器恢复规则,可与旧规则混用。
+- 节点:`Const(v)`(无符号 64 位常量)、`Reg(name)`(读旧帧
+  寄存器)、`Add/Sub/And(a, b)`、`Deref(addr, width)`(`width`
+  ∈ {1, 2, 4, 8} 字节,小端无符号)、`Select(cond, a, b)`(`cond != 0`
+  取 `a`,否则取 `b`;未选中分支不求值、不触发解引用)。
+  此外 `Cfa()` 只允许在寄存器规则表达式中引用本帧已算出的 CFA。
+- **操作数字宽与溢出**:所有运算按 64 位无符号执行,加减结果对
+  2**64 取模(无符号回绕),不抛溢出异常;按位与即 64 位按位与。
+- **解引用**:地址先按回绕语义算出再验界;读取定宽小端。
+- **求值快照**:表达式在当前帧的旧寄存器快照上求值;同帧另一条
+  规则覆盖了某寄存器,不影响本条表达式读到的值(并行恢复语义),
+  恢复一个寄存器不会影响同帧另一条规则。
+- **非法自引用**:CFA 表达式中出现 `Cfa()`(CFA 递归读取自己)
+  在构造 `CfaExpr` 时即抛 `UnwindInputError`,展开前拒绝。
+- **读寄存器为 undefined**:寄存器规则表达式读到不可恢复的寄存器
+  时结果为 `None`(undefined 传播);CFA 表达式读到则以
+  `CFA_REGISTER_UNDEFINED` 终止。
+- **全有或全无**:一帧的 CFA 与所有规则表达式先全部求值验证,
+  任一读越界即以 `MEMORY_OUT_OF_BOUNDS` 终止,该帧不进入
+  `frames`,绝不返回半个成功帧。
+
+示例(栈实时对齐):`CfaExpr(And(Add(Reg("sp"), Const(15)),
+Const(MASK64 ^ 15)))` 即 CFA = (sp + 15) & ~15。
+示例(保存地址间接寻址):`CfaExpr(Deref(Reg("tp"), 8))` 与
+`ExprRule(Deref(Add(Cfa(), Const(8)), 8))`。
+
+直接公式对照与上述例子的可运行版本见 `demo_iteration.py`;
+原有简单规则、查表地址(pc-1)与全部终止原因语义保持不变。
 
 `UnwindResult.frames` 是完整恢复的帧元组(每帧含 `index/pc/cfa/
 registers`);`UnwindResult.termination` 给出 `TerminationReason` 与
@@ -80,6 +128,10 @@ registers`);`UnwindResult.termination` 给出 `TerminationReason` 与
 
 - 帧数预算 `max_frames`:1..128(题面接口边界,默认 128)。
 - 规则表项数 ≤ 1024;寄存器数量 ≤ 256(防御性边界)。
+- 表达式:单棵节点数 ≤ `MAX_EXPR_NODES`(64),嵌套深度 ≤
+  `MAX_EXPR_DEPTH`(16,即求值栈深上限),单次求值步数 ≤
+  `MAX_EXPR_STEPS`(256,指令数上限)。超限属于非法程序,
+  在展开前(构造规则/表项时)拒绝。
 - 内存为任意有界 `bytes`/`bytearray`;所有读取先验界后执行。
 
 ## 精度说明
@@ -89,11 +141,12 @@ registers`);`UnwindResult.termination` 给出 `TerminationReason` 与
 
 ## 设计取舍与已知限制
 
-- 规则集是本题契约定义的合成子集(`same`/`undefined`/CFA 偏移读
-  8 字节/常量),**不是**完整的 DWARF CFI;不支持 `val_offset`、
-  寄存器间接、表达式求值等,也不解析 `.debug_frame`,不宣称任何
-  行业标准兼容。
-- 内存读取固定为 8 字节小端无符号;不支持其他宽度/端序。
+- 规则集是本题契约定义的合成子集(旧规则 + 上述小表达式),
+  **不是**完整的 DWARF CFI 或通用调试表达式语言:不支持
+  `val_offset`、乘除/移位/比较等运算、任意宽度读取,也不解析
+  `.debug_frame`,不宣称任何行业标准兼容。
+- 旧式 `Offset` 规则的内存读取固定为 8 字节小端无符号;定宽
+  (1/2/4/8 字节)读取仅经 `Deref` 表达式提供,端序一律小端。
 - 调用者 `sp = 被调帧 CFA` 这类规则不在本子集内,演示中 `sp` 以
   `SameValue` 处理。
 - 帧数上限 128 是硬边界;深层递归栈只会得到 `MAX_FRAMES_REACHED`
