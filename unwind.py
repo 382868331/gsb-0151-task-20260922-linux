@@ -41,6 +41,7 @@ from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 __all__ = [
     "UnwindInputError",
+    "UnwindArchiveError",
     "SameValue",
     "Undefined",
     "Offset",
@@ -73,6 +74,40 @@ MAX_REGISTERS = 256
 class UnwindInputError(ValueError):
     """公开 API 的任一输入违反契约时抛出。"""
 
+
+class UnwindArchiveError(ValueError):
+    """压缩存档数据损坏、截断或格式非法,拒绝加载时抛出。"""
+
+
+# ---------------------------------------------------------------------------
+# 规则表的压缩存档格式
+# ---------------------------------------------------------------------------
+#
+# 很多相邻 PC 区间共享同一份(CFA 规则 + 寄存器恢复规则)。存档把不同的
+# 规则行去重为"规则行池",每个区间只存 (start, end, 行号),相同部分只
+# 保存一次;加载后仍按 PC 二分查找,恢复单条规则不需要从头扫描。
+#
+# 二进制布局(全部小端):
+#   magic      4 字节  b"UWT1"
+#   u32        规则行数 n_rows
+#   规则行 x n_rows:
+#     u16 + utf8   CFA 基寄存器名
+#     i64          CFA 偏移
+#     u16          本行寄存器规则数
+#     规则 x n:  u16 + utf8 寄存器名, u8 类别标签,
+#                负载(offset: i64;constant: u64;same/undefined: 无)
+#   u32        区间数 n_ranges
+#   区间 x n_ranges: u64 start, u64 end, u32 行号
+#
+# 加载时严格校验:长度不足/多余、行号越界、标签未知、区间重叠等均抛出
+# UnwindArchiveError,绝不静默修复。
+
+_ARCHIVE_MAGIC = b"UWT1"
+
+_TAG_SAME = 0
+_TAG_UNDEFINED = 1
+_TAG_OFFSET = 2
+_TAG_CONSTANT = 3
 
 # ---------------------------------------------------------------------------
 # 输入校验辅助:可定位的错误,不静默纠正。
@@ -146,6 +181,13 @@ class Constant:
 
 Rule = Union[SameValue, Undefined, Offset, Constant]
 _RULE_TYPES = (SameValue, Undefined, Offset, Constant)
+
+_RULE_TO_TAG = {
+    SameValue: _TAG_SAME,
+    Undefined: _TAG_UNDEFINED,
+    Offset: _TAG_OFFSET,
+    Constant: _TAG_CONSTANT,
+}
 
 
 @dataclass(frozen=True)
@@ -256,6 +298,185 @@ class UnwindTable:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    # ------------------------------------------------------------------
+    # 压缩存档:相同规则行只保存一次,区间仅存 (start, end, 行号)。
+    # ------------------------------------------------------------------
+
+    def to_bytes(self) -> bytes:
+        """把规则表压缩序列化为字节串(相同规则行去重)。
+
+        相邻(或任意)区间共享的 (CFA 规则, 寄存器规则) 组合在存档中只
+        出现一次;每个区间只记录行号。加载用 from_bytes。
+        """
+        row_keys: List[Tuple] = []
+        row_index: Dict[Tuple, int] = {}
+        range_rows: List[int] = []
+        for entry in self._entries:
+            key = (
+                entry.cfa.register,
+                entry.cfa.offset,
+                tuple(sorted(entry.rules.items())),
+            )
+            idx = row_index.get(key)
+            if idx is None:
+                idx = len(row_keys)
+                row_index[key] = idx
+                row_keys.append(key)
+            range_rows.append(idx)
+
+        out = bytearray()
+        out += _ARCHIVE_MAGIC
+        out += len(row_keys).to_bytes(4, "little")
+        for reg, cfa_off, rules in row_keys:
+            encoded = reg.encode("utf-8")
+            out += len(encoded).to_bytes(2, "little")
+            out += encoded
+            out += cfa_off.to_bytes(8, "little", signed=True)
+            out += len(rules).to_bytes(2, "little")
+            for name, rule in rules:
+                encoded = name.encode("utf-8")
+                out += len(encoded).to_bytes(2, "little")
+                out += encoded
+                tag = _RULE_TO_TAG[type(rule)]
+                out.append(tag)
+                if isinstance(rule, Offset):
+                    out += rule.offset.to_bytes(8, "little", signed=True)
+                elif isinstance(rule, Constant):
+                    out += rule.value.to_bytes(8, "little")
+        out += len(self._entries).to_bytes(4, "little")
+        for entry, idx in zip(self._entries, range_rows):
+            out += entry.start.to_bytes(8, "little")
+            out += entry.end.to_bytes(8, "little")
+            out += idx.to_bytes(4, "little")
+        return bytes(out)
+
+    @classmethod
+    def from_bytes(cls, data) -> "UnwindTable":
+        """从 to_bytes 产出的压缩存档重建规则表。
+
+        损坏、截断、含多余尾部字节或内部引用越界的数据一律抛出
+        UnwindArchiveError,不做静默修复。重建过程复用构造校验
+        (区间重叠等仍抛 UnwindInputError)。
+        """
+        if isinstance(data, (bytearray, memoryview)):
+            data = bytes(data)
+        if not isinstance(data, bytes):
+            raise UnwindArchiveError(
+                f"存档必须是 bytes,得到 {type(data).__name__}"
+            )
+        pos = 0
+
+        def take(n: int, what: str) -> bytes:
+            nonlocal pos
+            if pos + n > len(data):
+                raise UnwindArchiveError(
+                    f"存档在偏移 0x{pos:x} 处截断:读取{what}需要 "
+                    f"{n} 字节,仅剩 {len(data) - pos} 字节"
+                )
+            chunk = data[pos:pos + n]
+            pos += n
+            return chunk
+
+        def take_int(n: int, what: str, signed: bool = False) -> int:
+            return int.from_bytes(take(n, what), "little", signed=signed)
+
+        def take_name(what: str) -> str:
+            length = take_int(2, what + "长度")
+            raw = take(length, what)
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise UnwindArchiveError(
+                    f"存档中{what}不是合法 UTF-8: {exc}"
+                ) from exc
+
+        magic = take(4, "魔数")
+        if magic != _ARCHIVE_MAGIC:
+            raise UnwindArchiveError(
+                f"存档魔数非法: {magic!r}(期望 {_ARCHIVE_MAGIC!r})"
+            )
+
+        n_rows = take_int(4, "规则行数")
+        if n_rows > MAX_TABLE_ENTRIES:
+            raise UnwindArchiveError(
+                f"规则行数 {n_rows} 超过上限 {MAX_TABLE_ENTRIES}"
+            )
+        rows: List[Tuple[CfaRule, Dict[str, Rule]]] = []
+        for ri in range(n_rows):
+            cfa_reg = take_name(f"第 {ri} 行的 CFA 基寄存器名")
+            cfa_off = take_int(8, f"第 {ri} 行的 CFA 偏移", signed=True)
+            n_rules = take_int(2, f"第 {ri} 行的规则数")
+            if n_rules > MAX_REGISTERS:
+                raise UnwindArchiveError(
+                    f"第 {ri} 行的规则数 {n_rules} 超过上限 {MAX_REGISTERS}"
+                )
+            rules: Dict[str, Rule] = {}
+            for ki in range(n_rules):
+                name = take_name(f"第 {ri} 行第 {ki} 条规则的寄存器名")
+                tag = take_int(1, f"寄存器 {name!r} 的规则标签")
+                if tag == _TAG_SAME:
+                    rule: Rule = SameValue()
+                elif tag == _TAG_UNDEFINED:
+                    rule = Undefined()
+                elif tag == _TAG_OFFSET:
+                    rule = Offset(
+                        take_int(8, f"寄存器 {name!r} 的偏移", signed=True)
+                    )
+                elif tag == _TAG_CONSTANT:
+                    rule = Constant(take_int(8, f"寄存器 {name!r} 的常量"))
+                else:
+                    raise UnwindArchiveError(
+                        f"第 {ri} 行寄存器 {name!r} 的规则标签非法: {tag}"
+                    )
+                rules[name] = rule
+            try:
+                rows.append((CfaRule(cfa_reg, cfa_off), rules))
+            except UnwindInputError as exc:
+                raise UnwindArchiveError(
+                    f"第 {ri} 行的 CFA 规则非法: {exc}"
+                ) from exc
+
+        n_ranges = take_int(4, "区间数")
+        if n_ranges > MAX_TABLE_ENTRIES:
+            raise UnwindArchiveError(
+                f"区间数 {n_ranges} 超过上限 {MAX_TABLE_ENTRIES}"
+            )
+        entries: List[TableEntry] = []
+        for ii in range(n_ranges):
+            start = take_int(8, f"区间 {ii} 的 start")
+            end = take_int(8, f"区间 {ii} 的 end")
+            row_no = take_int(4, f"区间 {ii} 的行号")
+            if row_no >= len(rows):
+                raise UnwindArchiveError(
+                    f"区间 {ii} 引用的行号 {row_no} 越界"
+                    f"(共 {len(rows)} 行)"
+                )
+            cfa, rules = rows[row_no]
+            try:
+                entries.append(TableEntry(start, end, cfa, dict(rules)))
+            except UnwindInputError as exc:
+                raise UnwindArchiveError(
+                    f"区间 {ii} 非法: {exc}"
+                ) from exc
+
+        if pos != len(data):
+            raise UnwindArchiveError(
+                f"存档末尾多出 {len(data) - pos} 字节(偏移 0x{pos:x} 起),"
+                f"疑似损坏"
+            )
+        return cls(entries)
+
+    def save(self, path) -> None:
+        """把压缩存档写入文件 path。"""
+        with open(path, "wb") as fh:
+            fh.write(self.to_bytes())
+
+    @classmethod
+    def load(cls, path) -> "UnwindTable":
+        """从文件 path 读取压缩存档(校验同 from_bytes)。"""
+        with open(path, "rb") as fh:
+            return cls.from_bytes(fh.read())
 
 
 # ---------------------------------------------------------------------------

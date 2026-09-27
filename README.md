@@ -22,7 +22,7 @@ from unwind import (
     unwind, UnwindTable, TableEntry, CfaRule,
     SameValue, Undefined, Offset, Constant,
     UnwindResult, Frame, Termination, TerminationReason,
-    UnwindInputError, MAX_FRAMES,
+    UnwindInputError, UnwindArchiveError, MAX_FRAMES,
 )
 
 result = unwind(pc, registers, memory, table,
@@ -40,6 +40,21 @@ result = unwind(pc, registers, memory, table,
 - 规则:`SameValue()`(保持旧值)、`Undefined()`(不可恢复,值为
   `None`)、`Offset(n)`(在 `CFA+n` 处读 8 字节)、`Constant(v)`。
   表项未覆盖的寄存器按 `SameValue` 处理。
+
+## 规则表的压缩存档
+
+相邻(或任意)PC 区间常共享同一份规则行。`UnwindTable.to_bytes()`
+把不同的 `(CFA 规则, 寄存器规则)` 组合去重为规则行池,每个区间只存
+`(start, end, 行号)`,相同部分只保存一次;`UnwindTable.from_bytes(data)`
+重建后仍按 PC 二分查找,恢复单条规则不需要从存档开头扫描。
+`save(path)` / `load(path)` 是等价的文件形式。
+
+- 布局(小端):魔数 `UWT1`、规则行池(去重)、区间表(行号引用)。
+- 加载严格校验:截断、多余尾部字节、非法魔数、未知规则标签、行号
+  越界、非法 UTF-8 一律抛 `UnwindArchiveError`;区间重叠等结构问题
+  仍由构造校验抛 `UnwindInputError`。不做静默修复。
+- 往返保证:`from_bytes(t.to_bytes()).entries == t.entries`;对同一
+  内存快照展开,压缩前后的帧序列与终止原因完全相同(有测试覆盖)。
 
 `UnwindResult.frames` 是完整恢复的帧元组(每帧含 `index/pc/cfa/
 registers`);`UnwindResult.termination` 给出 `TerminationReason` 与

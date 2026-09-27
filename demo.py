@@ -14,6 +14,7 @@ from unwind import (
     Offset,
     SameValue,
     TableEntry,
+    UnwindArchiveError,
     UnwindInputError,
     UnwindTable,
     unwind,
@@ -90,6 +91,21 @@ def main():
     except UnwindInputError as exc:
         print(f"--- 输入拒绝(实际触发)---")
         print(f"  UnwindInputError: {exc}")
+
+    # 4) 规则表压缩存档:三个区间共享同一规则行,存档只存一份;
+    #    加载后对同一内存快照展开,结果与压缩前完全一致。
+    blob = table.to_bytes()
+    restored = UnwindTable.from_bytes(blob)
+    again = unwind(0x3040, {"sp": 0x7F0, "fp": 0x800, "ra": 0x2050},
+                   mem, restored)
+    print("--- 压缩存档往返 ---")
+    print(f"  存档大小: {len(blob)} 字节(3 个区间共享 1 条规则行)")
+    print(f"  往返一致: 帧与终止原因相同 = "
+          f"{again.frames == ok.frames and again.termination == ok.termination}")
+    try:
+        UnwindTable.from_bytes(blob[:-3])  # 截断的存档必须拒绝
+    except UnwindArchiveError as exc:
+        print(f"  截断拒绝: UnwindArchiveError: {exc}")
 
 
 if __name__ == "__main__":
