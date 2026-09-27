@@ -35,8 +35,13 @@
 from __future__ import annotations
 
 import enum
+import os
+import struct
+import tempfile
+import zlib
 from bisect import bisect_right
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 __all__ = [
@@ -54,6 +59,11 @@ __all__ = [
     "Frame",
     "UnwindResult",
     "unwind",
+    "dumps_table",
+    "loads_table",
+    "save_table",
+    "load_table",
+    "TableFormatError",
     "MAX_FRAMES",
     "UINT64_MAX",
 ]
@@ -69,9 +79,20 @@ MAX_TABLE_ENTRIES = 1024
 #: 单次调用的寄存器数量上限(防御性边界,README 中说明)。
 MAX_REGISTERS = 256
 
+_TABLE_MAGIC = b"UWTC"
+_TABLE_VERSION = 1
+_RULE_SAME = 1
+_RULE_UNDEFINED = 2
+_RULE_OFFSET = 3
+_RULE_CONSTANT = 4
+
 
 class UnwindInputError(ValueError):
     """公开 API 的任一输入违反契约时抛出。"""
+
+
+class TableFormatError(ValueError):
+    """压缩规则表数据损坏、截断或版本不受支持时抛出。"""
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +277,347 @@ class UnwindTable:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+# ---------------------------------------------------------------------------
+# 规则表的压缩保存/加载
+# ---------------------------------------------------------------------------
+
+_OUTER_HEADER = struct.Struct("!4sHII")
+_MAX_TABLE_PAYLOAD = 32 * 1024 * 1024
+
+
+class _BinaryReader:
+    """带边界检查的大端二进制读取器。"""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+
+    def remaining(self) -> int:
+        return len(self._data) - self._pos
+
+    def take(self, size: int) -> bytes:
+        end = self._pos + size
+        if size < 0 or end > len(self._data):
+            raise TableFormatError("规则表数据被截断")
+        value = self._data[self._pos:end]
+        self._pos = end
+        return value
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        return int.from_bytes(self.take(2), "big")
+
+    def u32(self) -> int:
+        return int.from_bytes(self.take(4), "big")
+
+    def u64(self) -> int:
+        return int.from_bytes(self.take(8), "big")
+
+    def s64(self) -> int:
+        value = self.u64()
+        return value - (1 << 64) if value >= (1 << 63) else value
+
+    def finish(self) -> None:
+        if self._pos != len(self._data):
+            raise TableFormatError("规则表存在未声明的尾部数据")
+
+
+def _rule_key(rule: Rule) -> tuple:
+    if isinstance(rule, SameValue):
+        return (_RULE_SAME,)
+    if isinstance(rule, Undefined):
+        return (_RULE_UNDEFINED,)
+    if isinstance(rule, Offset):
+        return (_RULE_OFFSET, rule.offset)
+    if isinstance(rule, Constant):
+        return (_RULE_CONSTANT, rule.value)
+    raise UnwindInputError(
+        f"不支持的恢复规则类型: {type(rule).__name__}: {rule!r}"
+    )
+
+
+def _encode_rule(rule: Rule) -> bytes:
+    key = _rule_key(rule)
+    if key[0] == _RULE_SAME:
+        return bytes([_RULE_SAME])
+    if key[0] == _RULE_UNDEFINED:
+        return bytes([_RULE_UNDEFINED])
+    if key[0] == _RULE_OFFSET:
+        return bytes([_RULE_OFFSET]) + int.to_bytes(
+            key[1], 8, "big", signed=True
+        )
+    return bytes([_RULE_CONSTANT]) + int.to_bytes(
+        key[1], 8, "big", signed=False
+    )
+
+
+def dumps_table(table: UnwindTable) -> bytes:
+    """将规则表序列化为压缩、带校验和的自描述字节串。
+
+    相同 CFA 规则和相同寄存器恢复规则集合各只保存一次;每个 PC 区间仅
+    保存边界和两个模板编号。
+    """
+    if not isinstance(table, UnwindTable):
+        raise UnwindInputError(
+            f"table 必须是 UnwindTable,得到 {type(table).__name__}"
+        )
+
+    strings: List[str] = []
+    string_ids: Dict[str, int] = {}
+
+    def intern(value: str) -> int:
+        idx = string_ids.get(value)
+        if idx is None:
+            idx = len(strings)
+            string_ids[value] = idx
+            strings.append(value)
+        return idx
+
+    cfa_payloads: List[bytes] = []
+    cfa_ids: Dict[Tuple[str, int], int] = {}
+    pattern_payloads: List[bytes] = []
+    pattern_ids: Dict[Tuple[Tuple[str, tuple], ...], int] = {}
+
+    def cfa_id(rule: CfaRule) -> int:
+        key = (rule.register, rule.offset)
+        idx = cfa_ids.get(key)
+        if idx is None:
+            reg_id = intern(rule.register)
+            cfa_payloads.append(
+                reg_id.to_bytes(2, "big")
+                + rule.offset.to_bytes(8, "big", signed=True)
+            )
+            idx = len(cfa_payloads) - 1
+            cfa_ids[key] = idx
+        return idx
+
+    def pattern_id(rules: Mapping[str, Rule]) -> int:
+        normalized = tuple(
+            (name, _rule_key(rule))
+            for name, rule in sorted(rules.items())
+        )
+        idx = pattern_ids.get(normalized)
+        if idx is None:
+            body = b""
+            for name, key in normalized:
+                body += intern(name).to_bytes(2, "big")
+                body += bytes([key[0]])
+                if key[0] == _RULE_OFFSET:
+                    body += key[1].to_bytes(8, "big", signed=True)
+                elif key[0] == _RULE_CONSTANT:
+                    body += key[1].to_bytes(8, "big", signed=False)
+            pattern_payloads.append(
+                len(normalized).to_bytes(4, "big") + body
+            )
+            idx = len(pattern_payloads) - 1
+            pattern_ids[normalized] = idx
+        return idx
+
+    entry_payloads: List[bytes] = []
+    for entry in table.entries:
+        entry_payloads.append(
+            entry.start.to_bytes(8, "big")
+            + entry.end.to_bytes(8, "big")
+            + cfa_id(entry.cfa).to_bytes(4, "big")
+            + pattern_id(entry.rules).to_bytes(4, "big")
+        )
+
+    payload = b""
+    payload += len(strings).to_bytes(4, "big")
+    for value in strings:
+        raw = value.encode("utf-8")
+        if len(raw) > 0xFFFF:
+            raise UnwindInputError(f"寄存器名 UTF-8 长度超过 65535: {value!r}")
+        payload += len(raw).to_bytes(2, "big") + raw
+
+    payload += len(cfa_payloads).to_bytes(4, "big")
+    payload += b"".join(cfa_payloads)
+    payload += len(pattern_payloads).to_bytes(4, "big")
+    payload += b"".join(pattern_payloads)
+    payload += len(entry_payloads).to_bytes(4, "big")
+    payload += b"".join(entry_payloads)
+
+    compressed = zlib.compress(payload, level=9)
+    checksum = zlib.crc32(compressed) & 0xFFFFFFFF
+    header = _OUTER_HEADER.pack(
+        _TABLE_MAGIC, _TABLE_VERSION, len(compressed), checksum
+    )
+    return header + compressed
+
+
+def loads_table(data) -> UnwindTable:
+    """加载 :func:`dumps_table` 生成的压缩字节串。
+
+    任何截断、尾部多余字节、zlib 损坏、CRC 不匹配、越界模板编号或非法
+    PC 区间都会抛出 :class:`TableFormatError`;非法内容不会被静默修复。
+    """
+    if isinstance(data, str):
+        raise TableFormatError("规则表字节数据不能是 str")
+    try:
+        blob = bytes(data)
+    except Exception as exc:
+        raise TableFormatError(f"规则表必须是字节类对象: {exc}") from exc
+
+    if len(blob) < _OUTER_HEADER.size:
+        raise TableFormatError("规则表数据被截断")
+    magic, version, compressed_size, expected_crc = _OUTER_HEADER.unpack(
+        blob[:_OUTER_HEADER.size]
+    )
+    if magic != _TABLE_MAGIC:
+        raise TableFormatError("规则表魔数不匹配")
+    if version != _TABLE_VERSION:
+        raise TableFormatError(f"不支持的规则表版本: {version}")
+    if compressed_size > _MAX_TABLE_PAYLOAD:
+        raise TableFormatError("压缩规则表超过允许大小")
+    compressed = blob[_OUTER_HEADER.size:]
+    if len(compressed) != compressed_size:
+        raise TableFormatError("规则表压缩数据长度错误或被截断")
+    if (zlib.crc32(compressed) & 0xFFFFFFFF) != expected_crc:
+        raise TableFormatError("规则表 CRC32 校验失败")
+    try:
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(
+            compressed, _MAX_TABLE_PAYLOAD + 1
+        )
+    except zlib.error as exc:
+        raise TableFormatError(f"规则表 zlib 数据损坏: {exc}") from exc
+    if (
+        len(raw) > _MAX_TABLE_PAYLOAD
+        or decompressor.unconsumed_tail
+        or not decompressor.eof
+        or decompressor.unused_data
+    ):
+        raise TableFormatError("规则表解压数据超过限制或 zlib 流不完整")
+
+    reader = _BinaryReader(raw)
+    string_count = reader.u32()
+    if string_count > 262144:
+        raise TableFormatError("字符串表项数超过限制")
+    names: List[str] = []
+    for _ in range(string_count):
+        size = reader.u16()
+        raw_name = reader.take(size)
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise TableFormatError("寄存器名不是合法 UTF-8") from exc
+        if not name:
+            raise TableFormatError("寄存器名不能为空")
+        names.append(name)
+
+    def name_at(index: int) -> str:
+        if not 0 <= index < len(names):
+            raise TableFormatError("规则表引用了越界字符串编号")
+        return names[index]
+
+    cfa_count = reader.u32()
+    if cfa_count > MAX_TABLE_ENTRIES:
+        raise TableFormatError("CFA 模板数量超过规则表项上限")
+    cfa_templates: List[CfaRule] = []
+    for _ in range(cfa_count):
+        register_name = name_at(reader.u16())
+        cfa_offset = reader.s64()
+        try:
+            cfa_templates.append(CfaRule(register_name, cfa_offset))
+        except UnwindInputError as exc:
+            raise TableFormatError(f"CFA 模板非法: {exc}") from exc
+
+    pattern_count = reader.u32()
+    if pattern_count > MAX_TABLE_ENTRIES:
+        raise TableFormatError("寄存器规则模板数量超过规则表项上限")
+    patterns: List[Dict[str, Rule]] = []
+    for _ in range(pattern_count):
+        pair_count = reader.u32()
+        if pair_count > MAX_REGISTERS * MAX_TABLE_ENTRIES:
+            raise TableFormatError("寄存器规则数量超过限制")
+        rules: Dict[str, Rule] = {}
+        previous_name = None
+        for _ in range(pair_count):
+            name = name_at(reader.u16())
+            if previous_name is not None and name <= previous_name:
+                raise TableFormatError("规则模板中的寄存器必须严格升序且唯一")
+            previous_name = name
+            tag = reader.u8()
+            try:
+                if tag == _RULE_SAME:
+                    rules[name] = SameValue()
+                elif tag == _RULE_UNDEFINED:
+                    rules[name] = Undefined()
+                elif tag == _RULE_OFFSET:
+                    rules[name] = Offset(reader.s64())
+                elif tag == _RULE_CONSTANT:
+                    rules[name] = Constant(reader.u64())
+                else:
+                    raise TableFormatError(
+                        f"未知恢复规则类型编号: {tag}"
+                    )
+            except UnwindInputError as exc:
+                raise TableFormatError(f"寄存器规则模板非法: {exc}") from exc
+        patterns.append(rules)
+
+    entry_count = reader.u32()
+    if entry_count > MAX_TABLE_ENTRIES:
+        raise TableFormatError("规则表项数超过上限")
+    entries: List[TableEntry] = []
+    previous_end = 0
+    for i in range(entry_count):
+        start = reader.u64()
+        end = reader.u64()
+        cfa_index = reader.u32()
+        pattern_index = reader.u32()
+        if not start < end:
+            raise TableFormatError("规则区间必须满足 start < end")
+        if i > 0 and start < previous_end:
+            raise TableFormatError("加载的规则区间发生重叠")
+        if not 0 <= cfa_index < len(cfa_templates):
+            raise TableFormatError("规则区间引用了越界 CFA 模板编号")
+        if not 0 <= pattern_index < len(patterns):
+            raise TableFormatError("规则区间引用了越界寄存器规则模板编号")
+        try:
+            entries.append(
+                TableEntry(
+                    start, end,
+                    cfa_templates[cfa_index],
+                    dict(patterns[pattern_index]),
+                )
+            )
+        except UnwindInputError as exc:
+            raise TableFormatError(f"规则区间非法: {exc}") from exc
+        previous_end = end
+    reader.finish()
+    try:
+        return UnwindTable(entries)
+    except UnwindInputError as exc:
+        raise TableFormatError(f"规则表非法: {exc}") from exc
+
+
+def save_table(path, table: UnwindTable) -> None:
+    """以原子替换方式把压缩规则表写入 ``path``。"""
+    payload = dumps_table(table)
+    target = Path(path)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+        temp_path.replace(target)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_table(path) -> UnwindTable:
+    """从 :func:`save_table` 写入的文件加载规则表。"""
+    with Path(path).open("rb") as stream:
+        return loads_table(stream.read())
 
 
 # ---------------------------------------------------------------------------

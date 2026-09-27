@@ -6,7 +6,9 @@
 
 import os
 import sys
+import tempfile
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +24,11 @@ from unwind import (
     Undefined,
     UnwindInputError,
     UnwindTable,
+    TableFormatError,
+    dumps_table,
+    load_table,
+    loads_table,
+    save_table,
     unwind,
 )
 
@@ -510,6 +517,92 @@ class TestResultShape(unittest.TestCase):
             result.termination.reason, TerminationReason.MAX_FRAMES_REACHED
         )
         self.assertIsNone(result.frames[0].cfa)
+
+
+class TestCompressedTable(unittest.TestCase):
+    def build_mixed_table(self):
+        shared_rules = {
+            "sp": SameValue(),
+            "fp": Offset(-16),
+            "ra": Constant(0x1040),
+            "temp": Undefined(),
+        }
+        different_rules = {
+            "fp": Constant(0x2000),
+            "ra": Constant(0x2040),
+        }
+        return UnwindTable([
+            TableEntry(0x1000, 0x2000, CfaRule("fp", 16), shared_rules),
+            TableEntry(0x2000, 0x3000, CfaRule("fp", 16), shared_rules),
+            TableEntry(0x3000, 0x4000, CfaRule("sp", 0), different_rules),
+        ])
+
+    def test_roundtrip_preserves_entries_and_lookup(self):
+        table = self.build_mixed_table()
+        restored = loads_table(dumps_table(table))
+
+        self.assertEqual(len(restored), 3)
+        for original, loaded in zip(table.entries, restored.entries):
+            self.assertEqual(
+                (original.start, original.end, original.cfa),
+                (loaded.start, loaded.end, loaded.cfa),
+            )
+            self.assertEqual(original.rules, loaded.rules)
+
+        for pc in (0x1000, 0x1FFF, 0x2000, 0x2FFF, 0x3000, 0x3FFF):
+            self.assertIsNotNone(restored.lookup(pc))
+        for pc in (0xFFF, 0x4000, 0x5000):
+            self.assertIsNone(restored.lookup(pc))
+
+    def test_identical_rule_set_is_stored_once(self):
+        table = self.build_mixed_table()
+        payload = dumps_table(table)
+        raw = zlib.decompress(payload[14:])
+        self.assertEqual(raw.count((0x1040).to_bytes(8, "big")), 1)
+
+    def test_same_snapshot_unwinds_identically(self):
+        table = self.build_mixed_table()
+        restored = loads_table(dumps_table(table))
+        memory = bytearray(0x5000)
+        memory[0x3020:0x3028] = (0).to_bytes(8, "little")
+        registers = {
+            "sp": 0x3000,
+            "fp": 0x3020,
+            "ra": 0x3100,
+            "temp": 7,
+        }
+
+        before = unwind(0x3100, registers, memory, table)
+        after = unwind(0x3100, registers, memory, restored)
+        self.assertEqual(before, after)
+
+    def test_truncated_and_corrupt_data_are_rejected(self):
+        payload = dumps_table(self.build_mixed_table())
+        for size in (0, 4, 13, len(payload) - 1):
+            with self.assertRaises(TableFormatError):
+                loads_table(payload[:size])
+
+        damaged = bytearray(payload)
+        damaged[-1] ^= 0xFF
+        with self.assertRaises(TableFormatError):
+            loads_table(bytes(damaged))
+        with self.assertRaises(TableFormatError):
+            loads_table(payload + b"\0")
+        with self.assertRaises(TableFormatError):
+            loads_table(b"BAD!" + payload[4:])
+        with self.assertRaises(TableFormatError):
+            loads_table("not-bytes")
+
+    def test_file_save_and_load(self):
+        table = self.build_mixed_table()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "rules.uwt")
+            save_table(path, table)
+            restored = load_table(path)
+        self.assertEqual(
+            [e.rules for e in restored.entries],
+            [e.rules for e in table.entries],
+        )
 
 
 if __name__ == "__main__":

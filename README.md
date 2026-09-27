@@ -22,7 +22,8 @@ from unwind import (
     unwind, UnwindTable, TableEntry, CfaRule,
     SameValue, Undefined, Offset, Constant,
     UnwindResult, Frame, Termination, TerminationReason,
-    UnwindInputError, MAX_FRAMES,
+    UnwindInputError, TableFormatError,
+    dumps_table, loads_table, save_table, load_table, MAX_FRAMES,
 )
 
 result = unwind(pc, registers, memory, table,
@@ -44,6 +45,29 @@ result = unwind(pc, registers, memory, table,
 `UnwindResult.frames` 是完整恢复的帧元组(每帧含 `index/pc/cfa/
 registers`);`UnwindResult.termination` 给出 `TerminationReason` 与
 可定位的十六进制细节。
+
+### 压缩保存与加载
+
+```python
+blob = dumps_table(table)          # bytes:压缩、带 CRC32 的自描述格式
+loaded = loads_table(blob)         # UnwindTable,损坏/截断会拒绝加载
+save_table("rules.uwt", table)     # 写文件(临时文件 + 原子替换)
+loaded = load_table("rules.uwt")
+```
+
+- 格式依次保存全局寄存器名字符串表、去重后的 CFA 模板、去重后的
+  寄存器恢复规则模板和区间记录;相邻区间只要 CFA 或规则集相同,就只
+  保存对应 32 位模板编号。
+- 区间记录保存完整的 64 位半开边界 `[start,end)` 与 CFA/规则模板编号。
+  加载后的表仍按 `start` 排序,`lookup(pc)` 使用二分查找,不从整份记录
+  开头逐条扫描。
+- 四种恢复方式 `SameValue`、`Undefined`、`Offset`、`Constant` 都带类型
+  标记保存;显式列出的 `SameValue` 与缺省规则虽然展开语义相同,但前者会
+  作为规则模板内容保留。
+- 外层包含魔数、版本、压缩长度和 CRC32;载荷为 zlib 大端二进制。魔数/
+  版本错误、截断、压缩损坏、CRC 不匹配、尾部多余字节、越界模板编号、
+  非法 PC 区间、未知规则标记都会抛出 `TableFormatError`。
+- 解压和记录数量有防御性上限,不把损坏数据解释成另一个表。
 
 ## 语义要点
 
@@ -75,6 +99,8 @@ registers`);`UnwindResult.termination` 给出 `TerminationReason` 与
   报错而非合并)。
 - 表引用的寄存器必须存在于 `registers` 中,在展开前一次性校验,不会
   展开到一半才报错;`unwind` 是纯函数,失败不会留下未说明的部分变更。
+- `dumps_table` 的输入契约错误抛 `UnwindInputError`;已序列化字节或文件
+  的损坏/截断抛 `TableFormatError`。
 
 ## 输入上限
 
